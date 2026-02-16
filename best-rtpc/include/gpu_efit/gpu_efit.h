@@ -2,6 +2,7 @@
 
 #include "common/types.h"
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 namespace best_rtpc {
 
@@ -58,6 +59,17 @@ private:
     // Pre-allocated convergence check buffer (avoids per-iteration hipMalloc)
     float* d_conv_max_;
     float  h_conv_max_;   // pinned host staging for async readback
+
+    // ── Optimized Green function storage ──
+    // FP16 dense: halves memory traffic for Green matrix reads
+    __half* d_G_fp16_;       // FP16 dense Green matrix [N_bnd × N_inner]
+
+    // CSR sparse + FP16: skips near-zero elements + half precision
+    __half* d_G_sparse_vals_;   // non-zero values in FP16
+    int*    d_G_sparse_cols_;   // column indices
+    int*    d_G_sparse_row_ptr_;// row pointers [N_bnd + 1]
+    int     nnz_;               // number of non-zero elements
+    bool    use_sparse_;        // true when sparsity > 90%
 
     hipStream_t stream_;
 

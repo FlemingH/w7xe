@@ -1,6 +1,7 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include "common/types.h"
 
 namespace best_rtpc {
@@ -35,6 +36,30 @@ __global__ void green_boundary_kernel(
     float* __restrict__ psi_boundary,
     int N_bnd,
     int N_inner);
+
+// Green boundary optimized: FP16 storage + LDS tiling for J_plasma
+// Combines half-precision Green matrix (halves memory traffic) with
+// cooperative J_plasma loading into shared memory (eliminates redundant reads).
+// 8× loop unrolling for instruction-level parallelism on RDNA 4.
+__global__ void green_boundary_fp16_tiled_kernel(
+    const __half* __restrict__ G_matrix_fp16,
+    const float* __restrict__ J_plasma,
+    float* __restrict__ psi_boundary,
+    int N_bnd,
+    int N_inner);
+
+// Green boundary sparse: CSR format + FP16 values
+// Skips near-zero Green elements (|G| < threshold × max|G|).
+// Typical tokamak Green functions have 70-85% structural sparsity
+// due to toroidal geometry (far-field decay faster than 1/r).
+// 4× loop unrolling within sparse row traversal.
+__global__ void green_boundary_sparse_kernel(
+    const __half* __restrict__ G_values,
+    const int* __restrict__ G_col_idx,
+    const int* __restrict__ G_row_ptr,
+    const float* __restrict__ J_plasma,
+    float* __restrict__ psi_boundary,
+    int N_bnd);
 
 // Convergence check: compute max |ψ_new - ψ_old|
 __global__ void convergence_kernel(

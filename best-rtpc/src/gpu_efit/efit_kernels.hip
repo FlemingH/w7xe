@@ -1,4 +1,5 @@
 #include "gpu_efit/efit_kernels.h"
+#include <hip/hip_fp16.h>
 #include <float.h>
 
 namespace best_rtpc {
@@ -174,6 +175,110 @@ __global__ void green_boundary_kernel(
     // Remainder
     for (; j < N_inner; j++) {
         sum += G_row[j] * J_plasma[j];
+    }
+
+    psi_boundary[i] = sum;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Kernel 7: Optimized Green boundary (FP16 storage + LDS tiling)
+// Three optimizations combined:
+//   1. FP16 Green matrix halves memory traffic (dominant bottleneck)
+//   2. J_plasma tiled into LDS — cooperative load eliminates
+//      redundant global reads (N_bnd threads share same J vector)
+//   3. 8× loop unrolling maximizes ILP on RDNA 4's wide VGPR file
+//
+// Memory traffic reduction vs original FP32 kernel:
+//   Original: N_bnd × N_inner × 4 (G) + N_bnd × N_inner × 4 (J)
+//   Optimized: N_bnd × N_inner × 2 (G_fp16) + N_inner × 4 (J shared)
+//   Ratio: ~4× reduction for typical configurations
+// ═══════════════════════════════════════════════════════════════
+__global__ void green_boundary_fp16_tiled_kernel(
+    const __half* __restrict__ G_matrix_fp16,
+    const float* __restrict__ J_plasma,
+    float* __restrict__ psi_boundary,
+    int N_bnd,
+    int N_inner)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    extern __shared__ float s_J[];
+    float sum = 0.0f;
+
+    for (int tile_start = 0; tile_start < N_inner; tile_start += (int)blockDim.x) {
+        // Cooperative load: all threads in block share one J_plasma tile
+        int j_load = tile_start + threadIdx.x;
+        s_J[threadIdx.x] = (j_load < N_inner) ? J_plasma[j_load] : 0.0f;
+        __syncthreads();
+
+        if (i < N_bnd) {
+            int tile_end = min((int)blockDim.x, N_inner - tile_start);
+            const __half* G_row = G_matrix_fp16 + (size_t)i * N_inner + tile_start;
+
+            // 8× unrolled: FP16→FP32 conversion (v_cvt_f32_f16) + FMA
+            int j = 0;
+            int tile_end_8 = (tile_end / 8) * 8;
+            for (; j < tile_end_8; j += 8) {
+                sum += __half2float(G_row[j])     * s_J[j];
+                sum += __half2float(G_row[j + 1]) * s_J[j + 1];
+                sum += __half2float(G_row[j + 2]) * s_J[j + 2];
+                sum += __half2float(G_row[j + 3]) * s_J[j + 3];
+                sum += __half2float(G_row[j + 4]) * s_J[j + 4];
+                sum += __half2float(G_row[j + 5]) * s_J[j + 5];
+                sum += __half2float(G_row[j + 6]) * s_J[j + 6];
+                sum += __half2float(G_row[j + 7]) * s_J[j + 7];
+            }
+            for (; j < tile_end; j++) {
+                sum += __half2float(G_row[j]) * s_J[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (i < N_bnd) {
+        psi_boundary[i] = sum;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Kernel 8: Sparse Green boundary (CSR + FP16 values)
+// Exploits structural sparsity of the Green function matrix:
+//   - In toroidal geometry, G(r_bnd, r_inner) decays faster than 1/r
+//   - Elements below threshold (1% of max |G|) are dropped
+//   - CSR format stores only non-zero elements
+//   - FP16 values halve remaining memory traffic
+//
+// Combined speedup vs dense FP32:
+//   With 75% sparsity: 0.25 × 0.5 = 8× less Green data read
+//   Plus reduced FMA count = ~8× total improvement
+// ═══════════════════════════════════════════════════════════════
+__global__ void green_boundary_sparse_kernel(
+    const __half* __restrict__ G_values,
+    const int* __restrict__ G_col_idx,
+    const int* __restrict__ G_row_ptr,
+    const float* __restrict__ J_plasma,
+    float* __restrict__ psi_boundary,
+    int N_bnd)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N_bnd) return;
+
+    int row_start = G_row_ptr[i];
+    int row_end   = G_row_ptr[i + 1];
+
+    float sum = 0.0f;
+
+    // 4× unrolled sparse dot product with FP16→FP32 conversion
+    int jj = row_start;
+    int end_4 = row_start + ((row_end - row_start) / 4) * 4;
+    for (; jj < end_4; jj += 4) {
+        sum += __half2float(G_values[jj])     * J_plasma[G_col_idx[jj]];
+        sum += __half2float(G_values[jj + 1]) * J_plasma[G_col_idx[jj + 1]];
+        sum += __half2float(G_values[jj + 2]) * J_plasma[G_col_idx[jj + 2]];
+        sum += __half2float(G_values[jj + 3]) * J_plasma[G_col_idx[jj + 3]];
+    }
+    for (; jj < row_end; jj++) {
+        sum += __half2float(G_values[jj]) * J_plasma[G_col_idx[jj]];
     }
 
     psi_boundary[i] = sum;

@@ -8,6 +8,7 @@
 #include "distributed/rfm_transport.h"
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -324,6 +325,179 @@ void bench_efit_kernels(int grid, int repeats) {
     hipFree(d_G); hipFree(d_J); hipFree(d_bnd);
     hipFree(d_a_coeff); hipFree(d_m_coeff);
     delete[] h_buf;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BENCHMARK 2b: Green Boundary Kernel Comparison (3 variants)
+// ═══════════════════════════════════════════════════════════════════
+void bench_green_comparison(int grid, int repeats) {
+    printf("\n  [Green Kernel Comparison %d×%d]\n", grid, grid);
+
+    int M = grid - 2;
+    size_t mm = (size_t)M * M;
+    int N_bnd = 4 * (grid - 1);
+    int N_inner = (int)mm;
+    size_t G_size = (size_t)N_bnd * N_inner;
+
+    // ── Prepare Green matrix on host (same model as GpuEfit) ──
+    float h_step = 1.0f / (grid - 1);
+    float reg = h_step * 0.5f;
+    auto* h_G = new float[G_size];
+
+    for (int i = 0; i < N_bnd; i++) {
+        float xb, yb;
+        int side = i / (grid - 1);
+        int pos  = i % (grid - 1);
+        float t  = pos * h_step;
+        switch (side) {
+            case 0: xb = t;   yb = 0.0f; break;
+            case 1: xb = 1.0f; yb = t;   break;
+            case 2: xb = 1.0f - t; yb = 1.0f; break;
+            default: xb = 0.0f; yb = 1.0f - t; break;
+        }
+        for (int j = 0; j < N_inner; j++) {
+            int ix = j % M;
+            int iy = j / M;
+            float xi = (ix + 1) * h_step;
+            float yi = (iy + 1) * h_step;
+            float dx = xb - xi, dy = yb - yi;
+            float dist = std::sqrt(dx*dx + dy*dy + reg*reg);
+            h_G[(size_t)i * N_inner + j] = -1.0f / (2.0f * PI * dist);
+        }
+    }
+
+    // ── Convert to FP16 ──
+    auto* h_G_fp16 = new __half[G_size];
+    for (size_t i = 0; i < G_size; i++) {
+        h_G_fp16[i] = __float2half(h_G[i]);
+    }
+
+    // ── Build CSR sparse (threshold = 1% of max |G|) ──
+    float global_max = 0.0f;
+    for (size_t i = 0; i < G_size; i++) {
+        float av = std::fabs(h_G[i]);
+        if (av > global_max) global_max = av;
+    }
+    float threshold = global_max * GREEN_SPARSE_THRESHOLD;
+
+    std::vector<int> row_ptr(N_bnd + 1, 0);
+    int nnz = 0;
+    for (int i = 0; i < N_bnd; i++) {
+        for (int j = 0; j < N_inner; j++) {
+            if (std::fabs(h_G[(size_t)i * N_inner + j]) > threshold) nnz++;
+        }
+        row_ptr[i + 1] = nnz;
+    }
+    float sparsity = 1.0f - (float)nnz / (float)G_size;
+
+    auto* h_sv = new __half[nnz];
+    auto* h_sc = new int[nnz];
+    int idx = 0;
+    for (int i = 0; i < N_bnd; i++) {
+        for (int j = 0; j < N_inner; j++) {
+            float val = h_G[(size_t)i * N_inner + j];
+            if (std::fabs(val) > threshold) {
+                h_sv[idx] = __float2half(val);
+                h_sc[idx] = j;
+                idx++;
+            }
+        }
+    }
+
+    printf("    Green %d×%d: %.1f%% sparse, nnz=%d/%zu\n",
+           N_bnd, N_inner, sparsity * 100.0f, nnz, G_size);
+    printf("    FP32 dense: %.1f MB, FP16 dense: %.1f MB, Sparse CSR: %.1f MB\n",
+           G_size * 4.0f / (1024*1024), G_size * 2.0f / (1024*1024),
+           (nnz * (2 + 4) + (N_bnd + 1) * 4) / (1024.0 * 1024.0));
+
+    // ── Upload to device ──
+    float *d_G, *d_J, *d_bnd;
+    __half *d_G_fp16, *d_G_sv;
+    int *d_G_sc, *d_G_rp;
+
+    HIP_CHECK(hipMalloc(&d_G,  G_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_J,  mm * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_bnd, N_bnd * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_G_fp16, G_size * sizeof(__half)));
+    HIP_CHECK(hipMalloc(&d_G_sv, nnz * sizeof(__half)));
+    HIP_CHECK(hipMalloc(&d_G_sc, nnz * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_G_rp, (N_bnd + 1) * sizeof(int)));
+
+    HIP_CHECK(hipMemcpy(d_G, h_G, G_size * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_G_fp16, h_G_fp16, G_size * sizeof(__half), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_G_sv, h_sv, nnz * sizeof(__half), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_G_sc, h_sc, nnz * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_G_rp, row_ptr.data(), (N_bnd + 1) * sizeof(int), hipMemcpyHostToDevice));
+
+    // Fill J_plasma with peaked profile
+    auto* h_J_buf = new float[mm];
+    for (size_t i = 0; i < mm; i++) {
+        int ix = i % M, iy = (int)(i / M);
+        float x = (float)(ix + 1) / (grid - 1) - 0.5f;
+        float y = (float)(iy + 1) / (grid - 1) - 0.5f;
+        float r2 = x*x + y*y;
+        h_J_buf[i] = (r2 < 0.2f) ? 1.0f - r2 / 0.2f : 0.0f;
+    }
+    HIP_CHECK(hipMemcpy(d_J, h_J_buf, mm * sizeof(float), hipMemcpyHostToDevice));
+
+    hipStream_t stream;
+    HIP_CHECK(hipStreamCreate(&stream));
+    GpuTimer gtimer;
+
+    int threads = 256;
+    int blocks = (N_bnd + threads - 1) / threads;
+
+    // ── Variant 1: Original FP32 dense ──
+    {
+        std::vector<double> times;
+        for (int r = 0; r < repeats + 5; r++) {
+            gtimer.start(stream);
+            green_boundary_kernel<<<blocks, threads, 0, stream>>>(
+                d_G, d_J, d_bnd, N_bnd, N_inner);
+            gtimer.stop(stream);
+            float ms = gtimer.elapsed_ms();
+            if (r >= 5) times.push_back(ms);
+        }
+        Stats s = compute_stats(times);
+        print_stats("[V1] FP32 dense (original)", s);
+    }
+
+    // ── Variant 2: FP16 dense + LDS tiling ──
+    {
+        size_t smem = threads * sizeof(float);
+        std::vector<double> times;
+        for (int r = 0; r < repeats + 5; r++) {
+            gtimer.start(stream);
+            green_boundary_fp16_tiled_kernel<<<blocks, threads, smem, stream>>>(
+                d_G_fp16, d_J, d_bnd, N_bnd, N_inner);
+            gtimer.stop(stream);
+            float ms = gtimer.elapsed_ms();
+            if (r >= 5) times.push_back(ms);
+        }
+        Stats s = compute_stats(times);
+        print_stats("[V2] FP16 dense + LDS tiled", s);
+    }
+
+    // ── Variant 3: Sparse CSR + FP16 ──
+    {
+        std::vector<double> times;
+        for (int r = 0; r < repeats + 5; r++) {
+            gtimer.start(stream);
+            green_boundary_sparse_kernel<<<blocks, threads, 0, stream>>>(
+                d_G_sv, d_G_sc, d_G_rp, d_J, d_bnd, N_bnd);
+            gtimer.stop(stream);
+            float ms = gtimer.elapsed_ms();
+            if (r >= 5) times.push_back(ms);
+        }
+        Stats s = compute_stats(times);
+        print_stats("[V3] Sparse CSR + FP16", s);
+    }
+
+    // Cleanup
+    hipStreamDestroy(stream);
+    hipFree(d_G); hipFree(d_J); hipFree(d_bnd);
+    hipFree(d_G_fp16); hipFree(d_G_sv); hipFree(d_G_sc); hipFree(d_G_rp);
+    delete[] h_G; delete[] h_G_fp16; delete[] h_sv; delete[] h_sc; delete[] h_J_buf;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -716,6 +890,16 @@ int main(int argc, char** argv) {
 
         for (int grid : {65, 129, 257}) {
             bench_efit_kernels(grid, repeats);
+        }
+
+        printf("\n");
+        printf("──────────────────────────────────────────────────────────────────\n");
+        printf("  SECTION 2b: Green Kernel Optimization Comparison\n");
+        printf("  (FP32 Dense vs FP16+LDS Tiled vs Sparse CSR+FP16)\n");
+        printf("──────────────────────────────────────────────────────────────────\n");
+
+        for (int grid : {65, 129, 257}) {
+            bench_green_comparison(grid, repeats);
         }
     }
 

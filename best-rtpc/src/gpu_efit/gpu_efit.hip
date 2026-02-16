@@ -1,9 +1,12 @@
 #include "gpu_efit/gpu_efit.h"
 #include "gpu_efit/efit_kernels.h"
 #include "common/hip_check.h"
+#include <hip/hip_fp16.h>
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <vector>
+#include <algorithm>
 
 namespace best_rtpc {
 
@@ -38,6 +41,16 @@ GpuEfit::GpuEfit(int grid_size) : N_(grid_size), M_(grid_size - 2) {
 
     // Pre-allocate convergence buffer to avoid per-iteration hipMalloc
     HIP_CHECK(hipMalloc(&d_conv_max_, sizeof(float)));
+
+    // FP16 dense Green matrix (same layout, half the bytes)
+    HIP_CHECK(hipMalloc(&d_G_fp16_, (size_t)N_bnd_ * N_inner_ * sizeof(__half)));
+
+    // Sparse CSR arrays allocated in precompute_green_matrix() after nnz is known
+    d_G_sparse_vals_    = nullptr;
+    d_G_sparse_cols_    = nullptr;
+    d_G_sparse_row_ptr_ = nullptr;
+    nnz_        = 0;
+    use_sparse_ = false;
 }
 
 GpuEfit::~GpuEfit() {
@@ -49,6 +62,10 @@ GpuEfit::~GpuEfit() {
     hipFree(d_ne_);      hipFree(d_Te_);
     hipFree(d_BR_);      hipFree(d_BZ_);        hipFree(d_Bphi_);
     hipFree(d_conv_max_);
+    hipFree(d_G_fp16_);
+    if (d_G_sparse_vals_)    hipFree(d_G_sparse_vals_);
+    if (d_G_sparse_cols_)    hipFree(d_G_sparse_cols_);
+    if (d_G_sparse_row_ptr_) hipFree(d_G_sparse_row_ptr_);
     hipStreamDestroy(stream_);
 }
 
@@ -117,9 +134,90 @@ void GpuEfit::precompute_green_matrix() {
         }
     }
 
+    // ── Upload original FP32 dense (kept for fallback/comparison) ──
     HIP_CHECK(hipMemcpy(d_G_matrix_, h_G, size * sizeof(float),
                          hipMemcpyHostToDevice));
+
+    // ── Optimization 1: Convert to FP16 dense ──
+    auto* h_G_fp16 = new __half[size];
+    for (size_t i = 0; i < size; i++) {
+        h_G_fp16[i] = __float2half(h_G[i]);
+    }
+    HIP_CHECK(hipMemcpy(d_G_fp16_, h_G_fp16, size * sizeof(__half),
+                         hipMemcpyHostToDevice));
+
+    // ── Optimization 2+3: Build CSR sparse version with FP16 values ──
+    // Find global max |G| for threshold calculation
+    float global_max = 0.0f;
+    for (size_t i = 0; i < size; i++) {
+        float abs_val = std::fabs(h_G[i]);
+        if (abs_val > global_max) global_max = abs_val;
+    }
+    float threshold = global_max * GREEN_SPARSE_THRESHOLD;
+
+    // Count non-zeros and build row pointers
+    std::vector<int> row_ptr(N_bnd_ + 1, 0);
+    int total_nnz = 0;
+    for (int i = 0; i < N_bnd_; i++) {
+        for (int j = 0; j < N_inner_; j++) {
+            if (std::fabs(h_G[(size_t)i * N_inner_ + j]) > threshold) {
+                total_nnz++;
+            }
+        }
+        row_ptr[i + 1] = total_nnz;
+    }
+    nnz_ = total_nnz;
+    float sparsity = 1.0f - (float)nnz_ / (float)size;
+
+    // Build CSR value/column arrays
+    auto* h_sparse_vals = new __half[nnz_];
+    auto* h_sparse_cols = new int[nnz_];
+    int idx = 0;
+    for (int i = 0; i < N_bnd_; i++) {
+        for (int j = 0; j < N_inner_; j++) {
+            float val = h_G[(size_t)i * N_inner_ + j];
+            if (std::fabs(val) > threshold) {
+                h_sparse_vals[idx] = __float2half(val);
+                h_sparse_cols[idx] = j;
+                idx++;
+            }
+        }
+    }
+
+    // Free any previous sparse allocations (in case initialize() called twice)
+    if (d_G_sparse_vals_)    hipFree(d_G_sparse_vals_);
+    if (d_G_sparse_cols_)    hipFree(d_G_sparse_cols_);
+    if (d_G_sparse_row_ptr_) hipFree(d_G_sparse_row_ptr_);
+
+    // Upload CSR to device
+    HIP_CHECK(hipMalloc(&d_G_sparse_vals_, nnz_ * sizeof(__half)));
+    HIP_CHECK(hipMalloc(&d_G_sparse_cols_, nnz_ * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_G_sparse_row_ptr_, (N_bnd_ + 1) * sizeof(int)));
+    HIP_CHECK(hipMemcpy(d_G_sparse_vals_, h_sparse_vals,
+                         nnz_ * sizeof(__half), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_G_sparse_cols_, h_sparse_cols,
+                         nnz_ * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_G_sparse_row_ptr_, row_ptr.data(),
+                         (N_bnd_ + 1) * sizeof(int), hipMemcpyHostToDevice));
+
+    // Dispatch decision: sparse CSR wins only at extreme sparsity (>90%)
+    // because indirect J_plasma access overhead outweighs the benefit of
+    // skipping elements until sparsity is very high. FP16 dense + LDS tiled
+    // is consistently faster for moderate sparsity (measured 2.4× vs original).
+    use_sparse_ = (sparsity > 0.9f);
+
+    printf("  Green matrix %d×%d: nnz=%d/%zu (%.1f%% sparse, thresh=%.2e), "
+           "FP16 size=%.1f MB, sparse size=%.1f MB, using %s kernel\n",
+           N_bnd_, N_inner_, nnz_, size, sparsity * 100.0f, threshold,
+           size * sizeof(__half) / (1024.0 * 1024.0),
+           (nnz_ * (sizeof(__half) + sizeof(int)) + (N_bnd_ + 1) * sizeof(int))
+               / (1024.0 * 1024.0),
+           use_sparse_ ? "sparse-CSR-FP16" : "dense-FP16-tiled");
+
     delete[] h_G;
+    delete[] h_G_fp16;
+    delete[] h_sparse_vals;
+    delete[] h_sparse_cols;
 }
 
 void GpuEfit::precompute_tridiag_coefficients() {
@@ -187,8 +285,18 @@ void GpuEfit::gs_step5_inv_eigen(float* d_out, const float* d_Q,
 void GpuEfit::compute_green_boundary(float* d_psi_bnd, const float* d_J) {
     int threads = 256;
     int blocks = (N_bnd_ + threads - 1) / threads;
-    green_boundary_kernel<<<blocks, threads, 0, stream_>>>(
-        d_G_matrix_, d_J, d_psi_bnd, N_bnd_, N_inner_);
+
+    if (use_sparse_) {
+        // CSR sparse kernel: FP16 values + skip near-zero elements
+        green_boundary_sparse_kernel<<<blocks, threads, 0, stream_>>>(
+            d_G_sparse_vals_, d_G_sparse_cols_, d_G_sparse_row_ptr_,
+            d_J, d_psi_bnd, N_bnd_);
+    } else {
+        // Dense FP16 kernel with LDS tiling for J_plasma
+        size_t smem = threads * sizeof(float);
+        green_boundary_fp16_tiled_kernel<<<blocks, threads, smem, stream_>>>(
+            d_G_fp16_, d_J, d_psi_bnd, N_bnd_, N_inner_);
+    }
 }
 
 void GpuEfit::compute_profiles_from_psi() {

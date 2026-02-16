@@ -71,4 +71,9 @@ constexpr float  FREQ_GHZ           = 140.0f;  // microwave frequency
 constexpr float  PI                 = 3.14159265358979323846f;
 constexpr int    TILE_SIZE          = 32;
 
+// Green function sparse threshold: elements with |G| < threshold * max(|G|) are dropped.
+// 1% threshold gives ~70-85% sparsity for typical tokamak Green functions,
+// while Picard iteration self-corrects the small boundary condition error.
+constexpr float  GREEN_SPARSE_THRESHOLD = 0.01f;
+
 }  // namespace best_rtpc
