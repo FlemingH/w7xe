@@ -1,0 +1,2 @@
+/usr/bin/ar qc libdistributed.a CMakeFiles/distributed.dir/rfm_transport.cpp.o
+/usr/bin/ranlib libdistributed.a

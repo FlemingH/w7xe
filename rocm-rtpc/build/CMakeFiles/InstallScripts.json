@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/test/amd_workspace/w7xe/rocm-rtpc/build/cmake_install.cmake",
+		"/home/test/amd_workspace/w7xe/rocm-rtpc/build/src/common/cmake_install.cmake",
+		"/home/test/amd_workspace/w7xe/rocm-rtpc/build/src/gpu_efit/cmake_install.cmake",
+		"/home/test/amd_workspace/w7xe/rocm-rtpc/build/src/ray_tracing/cmake_install.cmake",
+		"/home/test/amd_workspace/w7xe/rocm-rtpc/build/src/distributed/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

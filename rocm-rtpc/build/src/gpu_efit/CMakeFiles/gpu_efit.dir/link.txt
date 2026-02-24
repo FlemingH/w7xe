@@ -1,0 +1,2 @@
+/usr/bin/ar qc libgpu_efit.a CMakeFiles/gpu_efit.dir/efit_kernels.hip.o CMakeFiles/gpu_efit.dir/gpu_efit.hip.o
+/usr/bin/ranlib libgpu_efit.a

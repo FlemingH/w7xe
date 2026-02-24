@@ -1,0 +1,2 @@
+/usr/bin/ar qc libray_tracing.a CMakeFiles/ray_tracing.dir/rt_kernels.hip.o CMakeFiles/ray_tracing.dir/ray_tracing.hip.o
+/usr/bin/ranlib libray_tracing.a
